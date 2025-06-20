@@ -1,0 +1,315 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  PYTHON_VERSION: '3.11'
+  CUDA_VERSION: '12.2.2'
+
+jobs:
+  # Unit Tests
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-${{ matrix.python-version }}-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-mock
+        pip install -e .
+        
+    - name: Run unit tests
+      run: |
+        python -m pytest alphafold/ -v --cov=alphafold --cov-report=xml --cov-report=html
+        
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  # Integration Tests
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -e .
+        
+    - name: Run integration tests
+      run: |
+        python run_alphafold_test.py --fasta_paths=alphafold/common/testdata/glucagon.fasta --max_template_date=2020-05-14 --data_dir=/tmp/alphafold_test --output_dir=/tmp/alphafold_test_output --model_preset=monomer --db_preset=reduced_dbs
+
+  # Security Scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Bandit security scan
+      uses: python-security/bandit-action@v1
+      with:
+        path: "alphafold/"
+        level: "medium"
+        format: "json"
+        output: "bandit-report.json"
+        
+    - name: Run Safety check
+      run: |
+        pip install safety
+        safety check --json --output safety-report.json || true
+        
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+  # Docker Build and Test
+  docker:
+    name: Docker Build & Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Build Docker image
+      run: |
+        docker build -t alphafold:test -f docker/Dockerfile .
+        
+    - name: Test Docker image
+      run: |
+        docker run --rm alphafold:test python -c "import alphafold; print('AlphaFold import successful')"
+        
+    - name: Run Docker container test
+      run: |
+        docker run --rm alphafold:test python run_alphafold_test.py --help
+
+  # Code Quality
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install linting tools
+      run: |
+        pip install flake8 black isort mypy pylint
+        
+    - name: Run Black code formatter check
+      run: |
+        black --check --diff alphafold/
+        
+    - name: Run isort import sorting check
+      run: |
+        isort --check-only --diff alphafold/
+        
+    - name: Run Flake8 linting
+      run: |
+        flake8 alphafold/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 alphafold/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        
+    - name: Run MyPy type checking
+      run: |
+        mypy alphafold/ --ignore-missing-imports --no-strict-optional
+        
+    - name: Run Pylint
+      run: |
+        pylint alphafold/ --disable=C0114,C0115,C0116 --output-format=parseable
+
+  # Dependencies Check
+  dependencies:
+    name: Dependencies Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install pip-tools
+      run: |
+        pip install pip-tools
+        
+    - name: Check for outdated dependencies
+      run: |
+        pip install pip-check-updates
+        pcu -u requirements.txt
+        
+    - name: Validate requirements.txt
+      run: |
+        pip install -r requirements.txt --dry-run
+
+  # Build Verification
+  build:
+    name: Build Verification
+    runs-on: ubuntu-latest
+    needs: [test, security, docker, code-quality, dependencies]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install build wheel
+        
+    - name: Build package
+      run: |
+        python -m build
+        
+    - name: Verify package structure
+      run: |
+        python setup.py check --strict
+        
+    - name: Test package installation
+      run: |
+        pip install dist/*.whl
+        python -c "import alphafold; print('Package installed successfully')"
+
+  # Documentation Check
+  docs:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install documentation tools
+      run: |
+        pip install sphinx sphinx-rtd-theme
+        
+    - name: Check README formatting
+      run: |
+        python -c "import markdown; markdown.markdown(open('README.md').read())"
+        
+    - name: Validate setup.py
+      run: |
+        python setup.py check
+
+  # Performance Test (Basic)
+  performance:
+    name: Performance Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -e .
+        
+    - name: Run basic performance test
+      run: |
+        python -c "
+        import time
+        import alphafold
+        start_time = time.time()
+        # Basic import and initialization test
+        print(f'AlphaFold import time: {time.time() - start_time:.2f} seconds')
+        "
+
+  # Final Status Check
+  status:
+    name: Status Check
+    runs-on: ubuntu-latest
+    needs: [test, integration-test, security, docker, code-quality, dependencies, build, docs, performance]
+    if: always()
+    
+    steps:
+    - name: Check job status
+      run: |
+        echo "All CI jobs completed"
+        echo "Test: ${{ needs.test.result }}"
+        echo "Integration Test: ${{ needs.integration-test.result }}"
+        echo "Security: ${{ needs.security.result }}"
+        echo "Docker: ${{ needs.docker.result }}"
+        echo "Code Quality: ${{ needs.code-quality.result }}"
+        echo "Dependencies: ${{ needs.dependencies.result }}"
+        echo "Build: ${{ needs.build.result }}"
+        echo "Docs: ${{ needs.docs.result }}"
+        echo "Performance: ${{ needs.performance.result }}"
+        
+    - name: Fail if any job failed
+      if: contains(needs.*.result, 'failure')
+      run: exit 1 
